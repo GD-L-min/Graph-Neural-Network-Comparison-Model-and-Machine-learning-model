@@ -1,0 +1,371 @@
+import argparse
+import csv
+import json
+import os
+import re
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Tuple
+
+import requests
+
+DEFAULT_FILTERED_TXT = "results/similarity/Filtered_results_0.95_1_million.txt"
+DEFAULT_OUTPUT_CSV = "results/similarity/"
+
+CAS_REGEX = re.compile(r"\b\d{2,7}-\d{2}-\d\b")
+PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+
+
+class RateLimiter:
+    def __init__(self, qps: float) -> None:
+        self._qps = max(float(qps), 0.0)
+        self._lock = threading.Lock()
+        self._next_time = 0.0
+
+    def wait(self) -> None:
+        if self._qps <= 0:
+            return
+        interval = 1.0 / self._qps
+        with self._lock:
+            now = time.perf_counter()
+            if now < self._next_time:
+                time.sleep(self._next_time - now)
+                now = time.perf_counter()
+            self._next_time = now + interval
+
+
+def load_cache(cache_path: Optional[str]) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+    if not cache_path:
+        return {}
+    path = Path(cache_path)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    for smiles, value in payload.items():
+        if isinstance(value, dict):
+            cache[smiles] = (value.get("cas"), value.get("cid"))
+        elif isinstance(value, (list, tuple)) and len(value) >= 2:
+            cache[smiles] = (value[0], value[1])
+    return cache
+
+
+def save_cache(cache_path: Optional[str], cache: Dict[str, Tuple[Optional[str], Optional[str]]]) -> None:
+    if not cache_path:
+        return
+    path = Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {smiles: {"cas": cas, "cid": cid} for smiles, (cas, cid) in cache.items()}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+@dataclass
+class MatchRecord:
+    query_id: str
+    query_smiles: str
+    library_id: str
+    library_smiles: str
+    similarity: float
+
+
+def parse_filtered_results(path: str) -> List[MatchRecord]:
+    records: List[MatchRecord] = []
+    query_id: Optional[str] = None
+    query_smiles: Optional[str] = None
+
+    query_pattern = re.compile(r"^查询分子:\s*(.+?)\s*\|\s*(.+)$")
+    match_pattern = re.compile(
+        r"^\s*\d+\.\s*库分子:\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*相似度:\s*([0-9.]+)"
+    )
+
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            query_match = query_pattern.match(stripped)
+            if query_match:
+                query_id = query_match.group(1).strip()
+                query_smiles = query_match.group(2).strip()
+                continue
+
+            match_match = match_pattern.match(stripped)
+            if match_match and query_id and query_smiles:
+                library_id = match_match.group(1).strip()
+                library_smiles = match_match.group(2).strip()
+                similarity = float(match_match.group(3))
+                records.append(
+                    MatchRecord(
+                        query_id=query_id,
+                        query_smiles=query_smiles,
+                        library_id=library_id,
+                        library_smiles=library_smiles,
+                        similarity=similarity,
+                    )
+                )
+
+    return records
+
+
+def find_cid_for_smiles(session: requests.Session, smiles: str, timeout: int = 20) -> Optional[str]:
+    url = f"{PUBCHEM_BASE}/compound/smiles/{requests.utils.quote(smiles)}/cids/TXT"
+    response = session.get(url, timeout=timeout)
+    if response.status_code != 200:
+        return None
+    cid = response.text.strip().splitlines()[0]
+    return cid if cid else None
+
+
+def fetch_synonyms_by_cid(session: requests.Session, cid: str, timeout: int = 20) -> List[str]:
+    url = f"{PUBCHEM_BASE}/compound/cid/{cid}/synonyms/JSON"
+    response = session.get(url, timeout=timeout)
+    if response.status_code != 200:
+        return []
+    payload = response.json()
+    info_list = payload.get("InformationList", {}).get("Information", [])
+    synonyms: List[str] = []
+    for info in info_list:
+        synonyms.extend(info.get("Synonym", []))
+    return synonyms
+
+
+def extract_cas_from_synonyms(synonyms: List[str]) -> Optional[str]:
+    for synonym in synonyms:
+        match = CAS_REGEX.search(synonym)
+        if match:
+            return match.group(0)
+    return None
+
+
+def resolve_cas_for_smiles(
+    session: requests.Session,
+    smiles: str,
+    retries: int = 3,
+    pause: float = 0.5,
+    timeout: int = 20,
+    limiter: Optional[RateLimiter] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    for attempt in range(1, retries + 1):
+        try:
+            if limiter:
+                limiter.wait()
+            cid = find_cid_for_smiles(session, smiles, timeout=timeout)
+            if not cid:
+                return None, None
+            if limiter:
+                limiter.wait()
+            synonyms = fetch_synonyms_by_cid(session, cid, timeout=timeout)
+            cas_number = extract_cas_from_synonyms(synonyms)
+            return cas_number, cid
+        except (requests.RequestException, ValueError, KeyError):
+            if attempt == retries:
+                return None, None
+            backoff = pause * (2 ** (attempt - 1))
+            time.sleep(backoff)
+    return None, None
+
+
+def resolve_many_smiles(
+    smiles_list: List[str],
+    retries: int,
+    pause: float,
+    timeout: int,
+    workers: int,
+    qps: float,
+    cache: Dict[str, Tuple[Optional[str], Optional[str]]],
+    cache_path: Optional[str],
+    resume: bool,
+) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+    limiter = RateLimiter(qps)
+    lock = threading.Lock()
+
+    def worker(smiles: str) -> Tuple[str, Tuple[Optional[str], Optional[str]]]:
+        if resume:
+            existing = cache.get(smiles)
+            if existing is not None:
+                return smiles, existing
+
+        with requests.Session() as session:
+            cas_number, cid = resolve_cas_for_smiles(
+                session,
+                smiles,
+                retries=retries,
+                pause=pause,
+                timeout=timeout,
+                limiter=limiter,
+            )
+        with lock:
+            cache[smiles] = (cas_number, cid)
+            save_cache(cache_path, cache)
+        return smiles, (cas_number, cid)
+
+    if workers <= 1:
+        for smiles in smiles_list:
+            worker(smiles)
+        return cache
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(worker, smiles): smiles for smiles in smiles_list}
+        done = 0
+        total = len(smiles_list)
+        for future in as_completed(futures):
+            _ = future.result()
+            done += 1
+            if done % 25 == 0 or done == total:
+                print(f"已完成 {done}/{total} 个查询")
+    return cache
+
+
+def build_output_path(filtered_path: str, output_path: Optional[str]) -> str:
+    if output_path:
+        if output_path.lower().endswith(".csv"):
+            return output_path
+        if output_path.endswith(("/", "\\")):
+            base = os.path.splitext(os.path.basename(filtered_path))[0]
+            return os.path.join(output_path, f"{base}_cas.csv")
+        if os.path.isdir(output_path):
+            base = os.path.splitext(os.path.basename(filtered_path))[0]
+            return os.path.join(output_path, f"{base}_cas.csv")
+        return f"{output_path}.csv"
+
+    directory = os.path.dirname(filtered_path)
+    base = os.path.splitext(os.path.basename(filtered_path))[0]
+    return os.path.join(directory, f"{base}_cas.csv")
+
+
+def write_results(records: List[MatchRecord], cas_map: Dict[str, Tuple[Optional[str], Optional[str]]], output_csv: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
+    header = [
+        "query_id",
+        "query_smiles",
+        "library_id",
+        "library_smiles",
+        "similarity",
+        "pubchem_cid",
+        "cas_number",
+    ]
+    with open(output_csv, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        for record in records:
+            cas_number, cid = cas_map.get(record.library_smiles, (None, None))
+            writer.writerow(
+                [
+                    record.query_id,
+                    record.query_smiles,
+                    record.library_id,
+                    record.library_smiles,
+                    f"{record.similarity:.4f}",
+                    cid or "",
+                    cas_number or "",
+                ]
+            )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="为 Filtered_results.txt 中的库分子查询 CAS 号"
+    )
+    parser.add_argument(
+        "--filtered_txt",
+        default=DEFAULT_FILTERED_TXT,
+        help="smiles_similarity_search 生成的筛选结果文件",
+    )
+    parser.add_argument(
+        "--output_csv",
+        default=DEFAULT_OUTPUT_CSV,
+        help="输出 CSV 路径，默认与输入同目录",
+    )
+    parser.add_argument(
+        "--pause",
+        type=float,
+        default=0.5,
+        help="每次请求失败后的重试等待秒数",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="单个 SMILES 的最大重试次数",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=20,
+        help="HTTP 请求超时时间（秒）",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=6,
+        help="并发线程数（建议 2-6；过高可能触发限流/失败）",
+    )
+    parser.add_argument(
+        "--qps",
+        type=float,
+        default=6.0,
+        help="全局请求速率上限（每秒请求数，0 表示不限制；建议 2-8）",
+    )
+    parser.add_argument(
+        "--cache_path",
+        default=None,
+        help="缓存文件路径（JSON）。提供后可断点续跑并避免重复查询",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="启用断点续跑：若缓存中已有该 SMILES 结果则跳过请求",
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(args.filtered_txt):
+        raise FileNotFoundError(f"未找到筛选结果文件: {args.filtered_txt}")
+
+    print("解析筛选结果文件...")
+    records = parse_filtered_results(args.filtered_txt)
+    if not records:
+        print("未解析到任何匹配记录，程序结束。")
+        return
+    print(f"解析到 {len(records)} 条匹配记录。")
+
+    unique_smiles = {record.library_smiles for record in records}
+    print(f"需要查询的唯一库分子数量: {len(unique_smiles)}")
+
+    cas_map: Dict[str, Tuple[Optional[str], Optional[str]]] = load_cache(args.cache_path)
+    if args.resume and cas_map:
+        print(f"已加载缓存记录数: {len(cas_map)}")
+
+    smiles_list = sorted(unique_smiles)
+    to_query = smiles_list
+    if args.resume and cas_map:
+        to_query = [s for s in smiles_list if s not in cas_map]
+        print(f"断点续跑启用：本次需实际查询 {len(to_query)}/{len(smiles_list)}")
+
+    if to_query:
+        resolve_many_smiles(
+            to_query,
+            retries=args.retries,
+            pause=args.pause,
+            timeout=args.timeout,
+            workers=args.workers,
+            qps=args.qps,
+            cache=cas_map,
+            cache_path=args.cache_path,
+            resume=args.resume,
+        )
+
+    output_csv = build_output_path(args.filtered_txt, args.output_csv)
+    print(f"写出结果到 {output_csv} ...")
+    write_results(records, cas_map, output_csv)
+    print("完成。")
+
+
+if __name__ == "__main__":
+    main()
