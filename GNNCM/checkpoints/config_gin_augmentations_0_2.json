@@ -1,0 +1,29 @@
+{
+    "encoder_name": "gin",
+    "input_dim": 19,
+    "hidden_dim": 256,
+    "projection_dim": 128,
+    "num_layers": 5,
+    "dropout": 0.5,
+    "temperature": 0.1,
+    "learning_rate": 0.001,
+    "weight_decay": 1e-05,
+    "batch_size": 512,
+    "epochs": 100,
+    "augmentation_methods": [
+        "node_masking",
+        "edge_deletion",
+        "subgraph_deletion"
+    ],
+    "augmentation_preset": "augmentations_0.2",
+    "augmentation_presets": [
+        "augmentations_0.1",
+        "augmentations_0.2",
+        "augmentations_0.25",
+        "augmentations_0.3"
+    ],
+    "augmentation_rates": {},
+    "data_path": "C:\\Users\\LGD\\Desktop\\cursor\\GNN-12.10\\molecular_gnn_final\\data\\processed\\processed_data.pkl",
+    "save_dir": "C:\\Users\\LGD\\Desktop\\cursor\\GNN-12.10\\molecular_gnn_final\\results\\checkpoints",
+    "log_dir": "C:\\Users\\LGD\\Desktop\\cursor\\GNN-12.10\\molecular_gnn_final\\logs\\tensorboard"
+}
