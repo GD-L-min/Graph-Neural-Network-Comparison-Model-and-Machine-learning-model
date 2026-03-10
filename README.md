@@ -26,7 +26,7 @@ If you want a quick overview of this repository, you can think of it as a two-st
 │  ├─ data/
 │  │  ├─ train_smiles.txt
 │  │  ├─ Anchor Molecules.txt
-│  │  └─ 1_million.txt
+│  │  └─ 1_million.csv
 │  ├─ models/
 │  │  ├─ encoders.py
 │  │  └─ gcl_model.py
